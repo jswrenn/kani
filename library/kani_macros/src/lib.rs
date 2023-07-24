@@ -89,16 +89,66 @@ pub fn derive_arbitrary(item: TokenStream) -> TokenStream {
     derive::expand_derive_arbitrary(item)
 }
 
+/// Add a precondition to this function.
+///
+/// This is part of the function contract API, together with [`ensures`].
+///
+/// The contents of the attribute is a condition over the input values to the
+/// annotated function. All Rust syntax is supported, even calling other
+/// functions, but the computations must be side effect free, e.g. it cannot
+/// perform I/O or use mutable memory.
+#[proc_macro_attribute]
+pub fn requires(attr: TokenStream, item: TokenStream) -> TokenStream {
+    attr_impl::requires(attr, item)
+}
+
+/// Add a postcondition to this function.
+///
+/// This is part of the function contract API, together with [`requires`].
+///
+/// The contents of the attribute is a condition over the input values to the
+/// annotated function *and* its return value, accessible as a variable called
+/// `result`. All Rust syntax is supported, even calling other functions, but
+/// the computations must be side effect free, e.g. it cannot perform I/O or use
+/// mutable memory.
+#[proc_macro_attribute]
+pub fn ensures(attr: TokenStream, item: TokenStream) -> TokenStream {
+    attr_impl::ensures(attr, item)
+}
 /// This module implements Kani attributes in a way that only Kani's compiler can understand.
 /// This code should only be activated when pre-building Kani's sysroot.
 #[cfg(kani_sysroot)]
 mod sysroot {
+
     use super::*;
 
     use {
         quote::{format_ident, quote},
         syn::{parse_macro_input, ItemFn},
     };
+
+    use proc_macro2::Ident;
+
+    /// Create a unique hash for a token stream (basically a [`std::hash::Hash`]
+    /// impl for `proc_macro2::TokenStream`).
+    fn hash_of_token_stream<H: std::hash::Hasher>(
+        hasher: &mut H,
+        stream: proc_macro2::TokenStream,
+    ) {
+        use proc_macro2::TokenTree;
+        use std::hash::Hash;
+        for token in stream {
+            match token {
+                TokenTree::Ident(i) => i.hash(hasher),
+                TokenTree::Punct(p) => p.as_char().hash(hasher),
+                TokenTree::Group(g) => {
+                    std::mem::discriminant(&g.delimiter()).hash(hasher);
+                    hash_of_token_stream(hasher, g.stream());
+                }
+                TokenTree::Literal(lit) => lit.to_string().hash(hasher),
+            }
+        }
+    }
 
     /// Annotate the harness with a #[kanitool::<name>] with optional arguments.
     macro_rules! kani_attribute {
@@ -184,6 +234,121 @@ mod sysroot {
         }
     }
 
+    /// Rewrites function contract annotations (`requires`, `ensures`) by lifing
+    /// the condition into a separate function. As an example: (using `ensures`)
+    ///
+    /// ```ignore
+    /// #[kani::ensures(x < result)]
+    /// fn foo(x: u32) -> u32 { .. }
+    /// ```
+    ///
+    /// Is rewritten to
+    ///
+    /// ```ignore
+    /// fn foo_ensures_<hash of foo>(x: u32, result: u32) {
+    ///     x < result
+    /// }
+    ///
+    /// #[kanitool::ensures = "foo_ensures_<hash of foo>"]
+    /// fn foo(x: u32) -> u32 { .. }
+    /// ```
+    ///
+    /// Note that CBMC's contracts always pass the return value (even for
+    /// `requires`) and so we also append it here.
+    ///
+    /// This macro is supposed to be called with the name of the procedural
+    /// macro it should generate, e.g. `requires_ensures(requires)`
+    fn handle_requires_ensures(name: &str, attr: TokenStream, item: TokenStream) -> TokenStream {
+        use proc_macro2::Span;
+        use syn::{
+            punctuated::Punctuated, FnArg, Pat, PatIdent, PatType, ReturnType, Signature, Token,
+            Type, TypeTuple,
+        };
+        let attr = proc_macro2::TokenStream::from(attr);
+
+        let a_short_hash = short_hash_of_token_stream(&item);
+
+        let item_fn @ ItemFn { sig, .. } = &parse_macro_input!(item as ItemFn);
+        let Signature { inputs, output, .. } = sig;
+
+        let gen_fn_name = identifier_for_generated_function(item_fn, name, a_short_hash);
+        let attribute = format_ident!("{name}");
+        let kani_attributes = quote!(
+            #[allow(dead_code)]
+            #[allow(unused_variables)]
+            #[kanitool::#attribute = stringify!(#gen_fn_name)]
+        );
+
+        let typ = match output {
+            ReturnType::Type(_, t) => t.clone(),
+            _ => Box::new(
+                TypeTuple { paren_token: Default::default(), elems: Punctuated::new() }.into(),
+            ),
+        };
+
+        let mut gen_fn_inputs = inputs.clone();
+        gen_fn_inputs.push(FnArg::Typed(PatType {
+            attrs: vec![],
+            pat: Box::new(Pat::Ident(PatIdent {
+                attrs: vec![],
+                by_ref: None,
+                mutability: None,
+                ident: Ident::new("result", Span::call_site()),
+                subpat: None,
+            })),
+            colon_token: Token![:](Span::call_site()),
+            ty: typ,
+        }));
+
+        assert!(sig.variadic.is_none(), "Variadic signatures are not supported");
+
+        let mut gen_sig = sig.clone();
+        gen_sig.inputs = gen_fn_inputs;
+        gen_sig.output =
+            ReturnType::Type(Default::default(), Box::new(Type::Verbatim(quote!(bool))));
+        gen_sig.ident = gen_fn_name;
+
+        quote!(
+            #gen_sig {
+                #attr
+            }
+
+            #kani_attributes
+            #item_fn
+        )
+        .into()
+    }
+
+    /// Hash this `TokenStream` and return an integer that is at most digits
+    /// long when hex formatted.
+    fn short_hash_of_token_stream(stream: &proc_macro::TokenStream) -> u64 {
+        use std::hash::Hasher;
+        let mut hasher = std::collections::hash_map::DefaultHasher::default();
+        hash_of_token_stream(&mut hasher, proc_macro2::TokenStream::from(stream.clone()));
+        let long_hash = hasher.finish();
+        long_hash % 0x1_000_000 // six hex digits
+    }
+
+    /// Makes consistent names for a generated function which was created for
+    /// `purpose`, from an attribute that decorates `related_function` with the
+    /// hash `hash`.
+    fn identifier_for_generated_function(
+        related_function: &ItemFn,
+        purpose: &str,
+        hash: u64,
+    ) -> Ident {
+        let identifier = format!("{}_{purpose}_{hash:x}", related_function.sig.ident);
+        Ident::new(&identifier, proc_macro2::Span::mixed_site())
+    }
+
+    pub fn requires(attr: TokenStream, item: TokenStream) -> TokenStream {
+        handle_requires_ensures("requires", attr, item)
+    }
+
+    pub fn ensures(attr: TokenStream, item: TokenStream) -> TokenStream {
+        handle_requires_ensures("ensures", attr, item)
+    }
+
     kani_attribute!(should_panic, no_args);
     kani_attribute!(solver);
     kani_attribute!(stub);
@@ -221,4 +386,6 @@ mod regular {
     no_op!(stub);
     no_op!(unstable);
     no_op!(unwind);
+    no_op!(requires);
+    no_op!(ensures);
 }

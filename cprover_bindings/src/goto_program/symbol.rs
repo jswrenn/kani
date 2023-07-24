@@ -1,7 +1,7 @@
 // Copyright Kani Contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 use super::super::utils::aggr_tag;
-use super::{DatatypeComponent, Expr, Location, Parameter, Stmt, Type};
+use super::{DatatypeComponent, Expr, Lambda, Location, Parameter, Stmt, Type};
 use crate::{InternStringOption, InternedString};
 
 /// Based off the CBMC symbol implementation here:
@@ -13,6 +13,8 @@ pub struct Symbol {
     pub location: Location,
     pub typ: Type,
     pub value: SymbolValues,
+    /// Contracts to be enforced (only supported for functions)
+    pub contract: Option<Box<FunctionContract>>,
 
     /// Optional debugging information
 
@@ -42,6 +44,22 @@ pub struct Symbol {
     pub is_thread_local: bool,
     pub is_volatile: bool,
     pub is_weak: bool,
+}
+
+/// The CBMC representation of a function contract with three types of clauses.
+/// See https://diffblue.github.io/cbmc/contracts-user.html for the meaning of
+/// each type of clause.
+#[derive(Clone, Debug)]
+pub struct FunctionContract {
+    pub(crate) requires: Vec<Lambda>,
+    pub(crate) ensures: Vec<Lambda>,
+    pub(crate) assigns: Vec<Lambda>,
+}
+
+impl FunctionContract {
+    pub fn new(requires: Vec<Lambda>, ensures: Vec<Lambda>, assigns: Vec<Lambda>) -> Self {
+        Self { requires, ensures, assigns }
+    }
 }
 
 /// Currently, only C is understood by CBMC.
@@ -84,6 +102,7 @@ impl Symbol {
             base_name,
             pretty_name,
 
+            contract: None,
             module: None,
             mode: SymbolModes::C,
             // global properties
@@ -104,6 +123,20 @@ impl Symbol {
             is_thread_local: false,
             is_volatile: false,
             is_weak: false,
+        }
+    }
+
+    /// Add this contract to the symbol (symbol must be a function) or fold the
+    /// conditions into an existing contract.
+    pub fn attach_contract(&mut self, contract: FunctionContract) {
+        assert!(self.typ.is_code());
+        match self.contract {
+            Some(ref mut prior) => {
+                prior.assigns.extend(contract.assigns);
+                prior.requires.extend(contract.requires);
+                prior.ensures.extend(contract.ensures);
+            }
+            None => self.contract = Some(Box::new(contract)),
         }
     }
 

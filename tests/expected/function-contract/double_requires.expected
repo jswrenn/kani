@@ -1,0 +1,9 @@
+double_requires::reduce1.missing_definition \
+	 - Status: FAILURE \
+	 - Description: "Function `double_requires::reduce1` with missing definition is unreachable"
+
+VERIFICATION:- FAILED
+
+double_requires::reduce2.missing_definition \
+	 - Status: FAILURE \
+	 - Description: "Function `double_requires::reduce2` with missing definition is unreachable"

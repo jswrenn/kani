@@ -170,6 +170,22 @@ pub enum ExprValue {
     },
 }
 
+/// The equivalent of a "mathematical function" in CBMC. Semantically this is an
+/// anonymous function object, similar to a closure, but without closing over an
+/// environment.
+///
+/// This is only valid for use as a function contract. It may not perform side
+/// effects, a property that is enforced on the CBMC side.
+///
+/// The precise nomenclature is that in CBMC a contract value has *type*
+/// `mathematical_function` and values of that type are `lambda`s. Since this
+/// struct represents such values it is named `Lambda`.
+#[derive(Debug, Clone)]
+pub struct Lambda {
+    pub arguments: Vec<(InternedString, Type)>,
+    pub body: Expr,
+}
+
 /// Binary operators. The names are the same as in the Irep representation.
 #[derive(Debug, Clone, Copy)]
 pub enum BinaryOperator {

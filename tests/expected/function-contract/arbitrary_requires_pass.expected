@@ -1,0 +1,4 @@
+div.assertion \
+	 - Status: SUCCESS \
+	 - Description: "attempt to divide by zero" 
+

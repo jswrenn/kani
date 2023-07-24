@@ -1,0 +1,3 @@
+arbitrary_ensures_fail::max.missing_definition \
+	 - Status: FAILURE \
+	 - Description: "Function `arbitrary_ensures_fail::max` with missing definition is unreachable" \

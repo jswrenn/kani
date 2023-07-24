@@ -1,0 +1,3 @@
+simple_ensures_pass::max.missing_definition \
+	 - Status: SUCCESS \
+	 - Description: "Function `simple_ensures_pass::max` with missing definition is unreachable"

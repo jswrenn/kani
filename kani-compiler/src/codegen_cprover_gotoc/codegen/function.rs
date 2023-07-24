@@ -4,7 +4,8 @@
 //! This file contains functions related to codegenning MIR functions into gotoc
 
 use crate::codegen_cprover_gotoc::GotocCtx;
-use cbmc::goto_program::{Expr, Stmt, Symbol};
+use crate::kani_middle::contracts::GFnContract;
+use cbmc::goto_program::{Expr, FunctionContract, Lambda, Stmt, Symbol, Type};
 use cbmc::InternString;
 use rustc_middle::mir::traversal::reverse_postorder;
 use rustc_middle::mir::{Body, HasLocalDecls, Local};
@@ -220,6 +221,90 @@ impl<'tcx> GotocCtx<'tcx> {
             Some(marshalled_tuple_value),
             loc,
         );
+    }
+
+    /// Convert the Kani level contract into a CBMC level contract by creating a
+    /// lambda that calls the contract implementation function.
+    ///
+    /// For instance say we are processing a contract on `f`
+    ///
+    /// ```rs
+    /// as_goto_contract(..., GFnContract { requires: <contact_impl_fn>, .. })
+    ///     = Contract {
+    ///         requires: [
+    ///             Lambda {
+    ///                 arguments: <return arg, args of f...>,
+    ///                 body: Call(codegen_fn_expr(contract_impl_fn), [args of f..., return arg])
+    ///             }
+    ///         ],
+    ///         ...
+    ///     }
+    /// ```
+    ///
+    /// A spec lambda in GOTO receives as its first argument the return value of
+    /// the annotated function. However at the top level we must receive `self`
+    /// as first argument, because rust requires it. As a result the generated
+    /// lambda takes the return value as first argument and then immediately
+    /// calls the generated spec function, but passing the return value as the
+    /// last argument.
+    fn as_goto_contract(&mut self, fn_contract: &GFnContract<Instance<'tcx>>) -> FunctionContract {
+        use rustc_middle::mir;
+        let mut handle_contract_expr = |instance| {
+            let mir = self.current_fn().mir();
+            assert!(mir.spread_arg.is_none());
+            let func_expr = self.codegen_func_expr(instance, None);
+            let mut mir_arguments: Vec<_> =
+                std::iter::successors(Some(mir::RETURN_PLACE + 1), |i| Some(*i + 1))
+                    .take(mir.arg_count + 1) // one extra for return value
+                    .collect();
+            let return_arg = mir_arguments.pop().unwrap();
+            let mir_operands: Vec<_> =
+                mir_arguments.iter().map(|l| mir::Operand::Copy((*l).into())).collect();
+            let mut arguments = self.codegen_funcall_args(&mir_operands, true);
+            let goto_argument_types: Vec<_> = [mir::RETURN_PLACE]
+                .into_iter()
+                .chain(mir_arguments.iter().copied())
+                .map(|a| self.codegen_ty(self.monomorphize(mir.local_decls()[a].ty)))
+                .collect();
+
+            mir_arguments.insert(0, return_arg);
+            arguments.push(Expr::symbol_expression(
+                self.codegen_var_name(&return_arg),
+                goto_argument_types.first().unwrap().clone(),
+            ));
+            Lambda {
+                arguments: mir_arguments
+                    .into_iter()
+                    .map(|l| self.codegen_var_name(&l).into())
+                    .zip(goto_argument_types)
+                    .collect(),
+                body: func_expr.call(arguments).cast_to(Type::Bool),
+            }
+        };
+
+        let requires =
+            fn_contract.requires().iter().copied().map(&mut handle_contract_expr).collect();
+        let ensures =
+            fn_contract.ensures().iter().copied().map(&mut handle_contract_expr).collect();
+        FunctionContract::new(requires, ensures, vec![])
+    }
+
+    /// Convert the contract to a CBMC contract, then attach it to `instance`.
+    /// `instance` must have previously been declared.
+    ///
+    /// This does not overwrite prior contracts but merges with them.
+    pub fn attach_contract(
+        &mut self,
+        instance: Instance<'tcx>,
+        contract: &GFnContract<Instance<'tcx>>,
+    ) {
+        // This should be safe, since the contract is pretty much evaluated as
+        // though it was the first (or last) assertion in the function.
+        self.set_current_fn(instance);
+        let goto_contract = self.as_goto_contract(contract);
+        let name = self.current_fn().name();
+        self.symbol_table.attach_contract(name, goto_contract);
+        self.reset_current_fn()
     }
 
     pub fn declare_function(&mut self, instance: Instance<'tcx>) {

@@ -15,8 +15,10 @@
 //! We have kept this module agnostic of any Kani code in case we can contribute this back to rustc.
 use tracing::{debug, debug_span, trace, warn};
 
+use std::collections::hash_map::Entry;
+
 use rustc_data_structures::fingerprint::Fingerprint;
-use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
@@ -37,11 +39,14 @@ use rustc_middle::ty::{
 use crate::kani_middle::coercion;
 use crate::kani_middle::stubbing::get_stub;
 
+use super::attributes;
+use super::contracts::GFnContract;
+
 /// Collect all reachable items starting from the given starting points.
 pub fn collect_reachable_items<'tcx>(
     tcx: TyCtxt<'tcx>,
     starting_points: &[MonoItem<'tcx>],
-) -> Vec<MonoItem<'tcx>> {
+) -> Vec<(MonoItem<'tcx>, Option<GFnContract<Instance<'tcx>>>)> {
     // For each harness, collect items using the same collector.
     // I.e.: This will return any item that is reachable from one or more of the starting points.
     let mut collector = MonoItemsCollector::new(tcx);
@@ -61,7 +66,7 @@ pub fn collect_reachable_items<'tcx>(
     // This helps us to debug the code, but it also provides the user a good experience since the
     // order of the errors and warnings is stable.
     let mut sorted_items: Vec<_> = collector.collected.into_iter().collect();
-    sorted_items.sort_by_cached_key(|item| to_fingerprint(tcx, item));
+    sorted_items.sort_by_cached_key(|item| to_fingerprint(tcx, &item.0));
     sorted_items
 }
 
@@ -144,7 +149,7 @@ struct MonoItemsCollector<'tcx> {
     /// The compiler context.
     tcx: TyCtxt<'tcx>,
     /// Set of collected items used to avoid entering recursion loops.
-    collected: FxHashSet<MonoItem<'tcx>>,
+    collected: FxHashMap<MonoItem<'tcx>, Option<GFnContract<Instance<'tcx>>>>,
     /// Items enqueued for visiting.
     queue: Vec<MonoItem<'tcx>>,
     #[cfg(debug_assertions)]
@@ -155,7 +160,7 @@ impl<'tcx> MonoItemsCollector<'tcx> {
     pub fn new(tcx: TyCtxt<'tcx>) -> Self {
         MonoItemsCollector {
             tcx,
-            collected: FxHashSet::default(),
+            collected: FxHashMap::default(),
             queue: vec![],
             #[cfg(debug_assertions)]
             call_graph: debug::CallGraph::default(),
@@ -168,12 +173,51 @@ impl<'tcx> MonoItemsCollector<'tcx> {
         self.reachable_items();
     }
 
+    pub fn add_to_queue<I: IntoIterator<Item = MonoItem<'tcx>>>(&mut self, i: I) {
+        self.queue.extend(i.into_iter().filter(|it| !self.collected.contains_key(it)))
+    }
+
+    /// Check if there are contracts attached to this visitable item and insert
+    /// them in the map if so. Returns whether the item was not yet present in
+    /// the map before (e.g. whether the reachability analysis should continue).
+    fn handle_contract(&mut self, to_visit: MonoItem<'tcx>) -> bool {
+        let (is_hit, visit_obligations) = if let Entry::Vacant(entry) =
+            self.collected.entry(to_visit)
+        {
+            let opt_contract = entry.key().def_id().as_local().and_then(|local_def_id| {
+                let substs = match entry.key() {
+                    MonoItem::Fn(inst) => inst.substs,
+                    _ => rustc_middle::ty::List::empty(),
+                };
+                let contract = attributes::extract_contract(self.tcx, local_def_id).map(|def_id| {
+                    Instance::resolve(self.tcx, ParamEnv::reveal_all(), *def_id, substs)
+                        .unwrap()
+                        .expect("No specific instance found")
+                });
+                contract.enforceable().then_some(contract)
+            });
+            let obligations = opt_contract.as_ref().map_or_else(Vec::new, |contract| {
+                [contract.requires(), contract.ensures()]
+                    .into_iter()
+                    .flat_map(IntoIterator::into_iter)
+                    .copied()
+                    .map(MonoItem::Fn)
+                    .collect()
+            });
+            entry.insert(opt_contract);
+            (true, obligations)
+        } else {
+            (false, vec![])
+        };
+        self.add_to_queue(visit_obligations);
+        is_hit
+    }
+
     /// Traverses the call graph starting from the given root. For every function, we visit all
     /// instruction looking for the items that should be included in the compilation.
     fn reachable_items(&mut self) {
         while let Some(to_visit) = self.queue.pop() {
-            if !self.collected.contains(&to_visit) {
-                self.collected.insert(to_visit);
+            if self.handle_contract(to_visit) {
                 let next_items = match to_visit {
                     MonoItem::Fn(instance) => self.visit_fn(instance),
                     MonoItem::Static(def_id) => self.visit_static(def_id),
@@ -185,8 +229,7 @@ impl<'tcx> MonoItemsCollector<'tcx> {
                 #[cfg(debug_assertions)]
                 self.call_graph.add_edges(to_visit, &next_items);
 
-                self.queue
-                    .extend(next_items.into_iter().filter(|item| !self.collected.contains(item)));
+                self.add_to_queue(next_items);
             }
         }
     }
